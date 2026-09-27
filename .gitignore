@@ -1,0 +1,5 @@
+.DS_Store
+.clangd
+.vscode
+.cache
+.theia

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>RC Car Telemetry</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+  <script src="sketch.js"></script>
+  <style>
+    html,
+    body {
+      margin: 0;
+      background: #000;
+      color: #fff;
+      font-family: sans-serif;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    header {
+      display: flex;
+      flex-direction: column;
+      background: #111;
+      border-bottom: 1px solid #333;
+      z-index: 100;
+    }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-around;
+      height: 50px;
+      width: 100%;
+    }
+
+    button {
+      padding: 10px 20px;
+      font-weight: bold;
+      border-radius: 5px;
+      border: none;
+      cursor: pointer;
+    }
+
+    .btn-c {
+      background: #007bff;
+      color: white;
+    }
+
+    .btn-d {
+      background: #444;
+      color: white;
+    }
+
+    .btn-rec {
+      background: #dc3545;
+      color: white;
+    }
+
+    .btn-play {
+      background: #28a745;
+      color: white;
+    }
+
+    #canvas-container {
+      flex: 1;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      position: relative;
+    }
+
+    footer {
+      height: 50px;
+      font-size: 11px;
+      padding: 5px 15px;
+      background: #111;
+      color: #888;
+      border-top: 1px solid #333;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    #status {
+      color: #00e1ff;
+      font-weight: bold;
+    }
+
+    #count {
+      font-family: monospace;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="header-row">
+      <button class="btn-c" onclick="connectBLE()">CONNECT</button>
+      <button class="btn-d" onclick="disconnectBLE()">DISCONNECT</button>
+    </div>
+    <div class="header-row">
+      <button id="btn-rec" class="btn-rec" onclick="toggleRec()">REC</button>
+      <button id="btn-play" class="btn-play" onclick="togglePlay()">PLAY</button>
+    </div>
+  </header>
+
+  <textarea id="hidden-data" style="display:none;"></textarea>
+
+  <div id="canvas-container"></div>
+
+  <footer>
+    <div id="status">STATUS: READY</div>
+    <div id="count">DATA: -</div>
+  </footer>
+</body>
+
+</html>
