@@ -283,14 +283,14 @@ function parseDataAndApply(val) {
   const mZ = val.match(/Z:\s*(-?[\d.]+)/);
   const mR = val.match(/Roll:\s*(-?[\d.]+)/);
   const mP = val.match(/Pitch:\s*(-?[\d.]+)/);
-  const mGX = val.match(/Pitch:\s*(-?[\d.]+)/);
-  const mGY = val.match(/Pitch:\s*(-?[\d.]+)/);
-  const mGZ = val.match(/Pitch:\s*(-?[\d.]+)/);
+  const mGX = val.match(/GX:\s*(-?[\d.]+)/);
+  const mGY = val.match(/GY:\s*(-?[\d.]+)/);
+  const mGZ = val.match(/GZ:\s*(-?[\d.]+)/);
 
-  // 抽出できた場合は数値に変換して変数に格納 (加速度は1000で割ってG単位にする想定)
-  if (mX) accelX = parseFloat(mX[1]) / 1000;
-  if (mY) accelY = parseFloat(mY[1]) / 1000;
-  if (mZ) accelZ = parseFloat(mZ[1]) / 1000;
+  // 抽出できた場合は数値に変換して変数に格納 (16384で割るのはセンサーの仕様に基づくスケーリング)
+  if (mX) accelX = parseFloat(mX[1]) / 16384;
+  if (mY) accelY = parseFloat(mY[1]) / 16384;
+  if (mZ) accelZ = parseFloat(mZ[1]) / 16384;
   if (mR) rollVal = parseFloat(mR[1]);
   if (mP) pitchVal = parseFloat(mP[1]);
   if (mGX) GXVal = parseFloat(mGX[1]);

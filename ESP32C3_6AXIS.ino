@@ -1,29 +1,18 @@
 /*
-  ESP32-C3 + BMI160 6-axis IMU
-  --------------------------------
-  旧GY-61(ADXL335)版からBMI160へ変更。
+  ESP32-C3とBMI160を使用する6軸センサーテレメトリー。
+  加速度からRoll/Pitchを計算し、加速度・角度・角速度をBLEで送信します。
 
-  変更しない部分:
-    - BLE Service / Characteristic UUID
-    - BLEデバイス名
-    - BLE接続/切断処理
-    - OLED表示
-    - SWITCH_PIN
-    - BLE送信フォーマットの基本構造
+  BMI160の配線:
+    I2C SDA = GPIO5、SCL = GPIO6
+    SA0/SDOをVDDIOへ接続するとI2Cアドレスは0x69になります。
+    CSBをVDDIOへ接続してI2Cモードにします。
 
-  BMI160:
-    I2C SDA = GPIO5
-    I2C SCL = GPIO6
-    SA0/SDO = VDDIO -> I2C address 0x69
-    CSB     = VDDIO -> I2C mode
+  センサーの設定と換算:
+    加速度 X/Y/Z: 符号付き16 bit、±2 g、16384 LSB/g
+    角速度 X/Y/Z: 符号付き16 bit、±2000 deg/s、16.4 LSB/(deg/s)
 
-  BMI160 data:
-    accel X/Y/Z : 16-bit signed, ±2g, 16384 LSB/g
-    gyro  X/Y/Z : 16-bit signed, ±2000 dps, 16.4 LSB/dps
-
-  BMI160の生データからRoll/Pitchを加速度で計算します。
-  ジャイロ値も読み取り、BLEには従来のX/Y/Z + Roll/Pitchに加えて
-  GX/GY/GZを追加しています。
+  Roll/Pitchは重力方向を示す加速度から計算します。
+  BLEには生の加速度、計算した角度、平滑化した角速度を送信します。
 */
 
 #include <Arduino.h>
@@ -36,11 +25,11 @@
 #include <BLE2902.h>
 
 // --- ピン割り当て設定 ---
-#define SWITCH_PIN 3
 #define SDA_PIN 5
 #define SCL_PIN 6
 
-// --- BLE設定（従来のまま） ---
+// --- BLE設定 ---
+// Web画面と接続するためのデバイス名、サービスUUID、特性UUIDです。
 #define BLE_NAME "RC_CAR_TELEMETRY"
 #define SERVICE_UUID "12345678-1234-1234-1234-1234567890ab"
 #define CHARACTERISTIC_UUID "abcdefab-1234-5678-1234-abcdefabcdef"
@@ -49,7 +38,7 @@
 #define BMI160_ADDR 0x69   // 回路図では SA0/SDO が VDD にプルアップ
 #define BMI160_CHIP_ID 0xD1
 
-// BMI160 registers
+// BMI160で使用するレジスターアドレスです。
 #define REG_CHIP_ID   0x00
 #define REG_GYR_X_L   0x0C
 #define REG_ACC_X_L   0x12
@@ -59,20 +48,23 @@
 #define REG_GYR_RANGE 0x43
 #define REG_CMD       0x7E
 
-// BMI160 commands
+// BMI160の加速度計とジャイロを通常動作モードにするコマンドです。
 #define CMD_ACC_NORMAL 0x11
 #define CMD_GYR_NORMAL 0x15
 
-// --- グローバル変数 ---
+// BLEサーバー、通知用Characteristic、および接続状態を保持します。
 BLECharacteristic *pCharacteristic;
 BLEServer *pServer = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
+// センサー値のローパスフィルター出力。初期状態ではZ方向に重力があると仮定します。
 float fX = 0.0f, fY = 0.0f, fZ = 1.0f;
 float fGX = 0.0f, fGY = 0.0f, fGZ = 0.0f;
+// 新しい測定値をどの程度フィルター出力へ反映するかを決めます。
 const float filterAlpha = 0.5f;
 
+// 72x40 OLED用のU8g2ドライバー。I2CのSCL/SDAピンを明示しています。
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(
   U8G2_R0, /* reset=*/U8X8_PIN_NONE, SCL_PIN, SDA_PIN
 );
@@ -81,6 +73,7 @@ U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(
 // BMI160 low-level I2C
 // -----------------------------------------------------------------------------
 
+// BMI160の指定レジスターへ1バイトを書き込みます。
 bool bmi160WriteReg(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(BMI160_ADDR);
   Wire.write(reg);
@@ -88,6 +81,8 @@ bool bmi160WriteReg(uint8_t reg, uint8_t value) {
   return Wire.endTransmission() == 0;
 }
 
+// 指定レジスターからlenバイトを読み込みます。
+// レジスター指定後にリピートスタートを発行し、読み取った値をdataへ格納します。
 bool bmi160ReadRegs(uint8_t reg, uint8_t *data, size_t len) {
   Wire.beginTransmission(BMI160_ADDR);
   Wire.write(reg);
@@ -102,16 +97,20 @@ bool bmi160ReadRegs(uint8_t reg, uint8_t *data, size_t len) {
   return true;
 }
 
+// BMI160のレジスターを1バイト読み込みます。
 uint8_t bmi160ReadReg(uint8_t reg) {
   uint8_t value = 0;
   bmi160ReadRegs(reg, &value, 1);
   return value;
 }
 
+// リトルエンディアンの2バイトを符号付き16 bit値へ組み立てます。
 int16_t makeInt16(uint8_t lo, uint8_t hi) {
   return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
 }
 
+// チップIDを確認し、加速度計・ジャイロを通常モードと測定範囲に設定します。
+// いずれかの通信または設定に失敗した場合はfalseを返します。
 bool bmi160Init() {
   delay(50);
 
@@ -124,27 +123,24 @@ bool bmi160Init() {
     return false;
   }
 
-  // Accelerometer: normal mode
+  // 加速度計を通常動作モードにします。
   if (!bmi160WriteReg(REG_CMD, CMD_ACC_NORMAL)) return false;
   delay(5);
 
-  // Gyroscope: normal mode
+  // ジャイロを通常動作モードにします。起動完了まで待ってから設定を続けます。
   if (!bmi160WriteReg(REG_CMD, CMD_GYR_NORMAL)) return false;
   delay(80);
 
-  // ACC_CONF:
-  // ODR = 100 Hz (0x08), normal bandwidth setting (0x02)
-  // 0x28 is a commonly used 100 Hz / normal bandwidth setting.
+  // 加速度計を100 Hz、通常帯域幅に設定します。
   if (!bmi160WriteReg(REG_ACC_CONF, 0x28)) return false;
 
-  // ACC_RANGE = ±2g
+  // 加速度の測定範囲を±2 gに設定します。
   if (!bmi160WriteReg(REG_ACC_RANGE, 0x03)) return false;
 
-  // GYR_CONF:
-  // ODR = 100 Hz (0x08), normal bandwidth setting (0x02)
+  // ジャイロを100 Hz、通常帯域幅に設定します。
   if (!bmi160WriteReg(REG_GYR_CONF, 0x28)) return false;
 
-  // GYR_RANGE = ±2000 deg/s
+  // ジャイロの測定範囲を±2000 deg/sに設定します。
   if (!bmi160WriteReg(REG_GYR_RANGE, 0x00)) return false;
 
   delay(20);
@@ -152,6 +148,8 @@ bool bmi160Init() {
   return true;
 }
 
+// 加速度と角速度を読み出し、生データと物理単位へ換算した値を返します。
+// 通信に失敗した場合はfalseを返します。
 bool bmi160Read(float &ax, float &ay, float &az,
                 float &gx, float &gy, float &gz,
                 int16_t &axRaw, int16_t &ayRaw, int16_t &azRaw,
@@ -170,12 +168,12 @@ bool bmi160Read(float &ax, float &ay, float &az,
   gyRaw = makeInt16(gyro[2], gyro[3]);
   gzRaw = makeInt16(gyro[4], gyro[5]);
 
-  // ±2g: 16384 LSB/g
+  // 加速度の生データをg単位へ換算します（±2 g設定では16384 LSB/g）。
   ax = (float)axRaw / 16384.0f;
   ay = (float)ayRaw / 16384.0f;
   az = (float)azRaw / 16384.0f;
 
-  // ±2000 deg/s: 16.4 LSB/(deg/s)
+  // 角速度の生データをdeg/sへ換算します（±2000 deg/s設定では16.4 LSB/(deg/s)）。
   gx = (float)gxRaw / 16.4f;
   gy = (float)gyRaw / 16.4f;
   gz = (float)gzRaw / 16.4f;
@@ -187,6 +185,7 @@ bool bmi160Read(float &ax, float &ay, float &az,
 // BLE
 // -----------------------------------------------------------------------------
 
+// クライアントからCharacteristicへ書き込みがあったとき、受信内容をシリアルへ表示します。
 class MyCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
@@ -198,6 +197,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// BLE接続・切断イベントに応じて接続状態を更新します。
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
@@ -210,6 +210,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
+// BLEデバイス名、サービス、Characteristic、通知設定を作成してアドバタイズを開始します。
 void BLESetup() {
   BLEDevice::init(BLE_NAME);
   pServer = BLEDevice::createServer();
@@ -217,6 +218,7 @@ void BLESetup() {
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
+  // センサーデータの読取り・書込み・通知を許可します。
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ |
@@ -228,6 +230,7 @@ void BLESetup() {
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
 
+  // 接続先がサービスを発見できるよう、サービスUUIDを含めて広告します。
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
@@ -236,6 +239,7 @@ void BLESetup() {
   pAdvertising->start();
 }
 
+// Characteristicの値を更新し、接続中のクライアントへ通知します。
 void BLEWrite(String msg) {
   pCharacteristic->setValue(msg.c_str());
   pCharacteristic->notify();
@@ -246,6 +250,7 @@ void BLEWrite(String msg) {
 // OLED
 // -----------------------------------------------------------------------------
 
+// Rollで台形を回転し、Pitchに応じて上辺の幅を変えてOLEDに姿勢を表示します。
 void drawMovingTrapezoid(float roll, float pitch) {
   const float cx = 35.0f, cy = 20.0f;
   float baseW = 15.0f, h_half = 8.0f;
@@ -254,6 +259,7 @@ void drawMovingTrapezoid(float roll, float pitch) {
   float rx[4] = { -w_top, w_top, baseW, -baseW };
   float ry[4] = { -h_half, -h_half, h_half, h_half };
 
+  // Rollをラジアンに変換し、各頂点を中心(cx, cy)の周りで回転します。
   float rad = roll * M_PI / 180.0f;
   float s = sin(rad);
   float c = cos(rad);
@@ -275,15 +281,14 @@ void drawMovingTrapezoid(float roll, float pitch) {
 // setup / loop
 // -----------------------------------------------------------------------------
 
+// 起動時にシリアル、OLED、I2C、BMI160、BLEの順に初期化します。
 void setup() {
   Serial.begin(115200);
 
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf);
 
-  pinMode(SWITCH_PIN, INPUT_PULLUP);
-
-  // BMI160 I2C
+  // BMI160とOLEDで共有するI2Cバスを開始し、通信速度を400 kHzに設定します。
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
 
@@ -291,6 +296,7 @@ void setup() {
   u8g2.drawStr(0, 10, "BMI160 Init...");
   u8g2.sendBuffer();
 
+  // センサーの初期化結果にかかわらずBLEを開始し、状態をシリアルへ表示します。
   bool sensorOK = bmi160Init();
 
   BLESetup();
@@ -302,6 +308,7 @@ void setup() {
   }
 }
 
+// センサーを読み取り、表示・BLE通知を更新します。
 void loop() {
   u8g2.clearBuffer();
 
@@ -312,6 +319,7 @@ void loop() {
   float ax, ay, az;
   float gx, gy, gz;
 
+  // 生データと単位換算済みデータを同時に受け取ります。
   bool sensorOK = bmi160Read(
     ax, ay, az, gx, gy, gz,
     axRaw, ayRaw, azRaw,
@@ -322,22 +330,21 @@ void loop() {
   float pitch = 0.0f;
 
   if (sensorOK) {
-    // Simple low-pass filter for accelerometer
+    // 加速度の急な変化を抑え、姿勢計算に使う値を滑らかにします。
     fX = (ax * filterAlpha) + (fX * (1.0f - filterAlpha));
     fY = (ay * filterAlpha) + (fY * (1.0f - filterAlpha));
     fZ = (az * filterAlpha) + (fZ * (1.0f - filterAlpha));
 
-    // Simple low-pass filter for gyro
+    // 角速度にも同じローパスフィルターを適用します。
     fGX = (gx * filterAlpha) + (fGX * (1.0f - filterAlpha));
     fGY = (gy * filterAlpha) + (fGY * (1.0f - filterAlpha));
     fGZ = (gz * filterAlpha) + (fGZ * (1.0f - filterAlpha));
 
-    // Roll/Pitch from gravity vector.
-    // This preserves the same basic angle convention as the old sketch.
+    // 重力ベクトルからRoll/Pitchを度単位で計算します。
     roll = atan2(fY, fZ) * 180.0f / PI;
     pitch = atan2(-fX, sqrt(fY * fY + fZ * fZ)) * 180.0f / PI;
 
-    // Keep old X/Y/Z/Roll/Pitch fields and append gyro fields.
+    // BLE送信文字列。X/Y/Zは生加速度、Roll/Pitchは度、GX/GY/GZはdeg/sです。
     snprintf(
       buf, sizeof(buf),
       "X:%d,Y:%d,Z:%d,Roll:%6.2f,Pitch:%6.2f,GX:%6.1f,GY:%6.1f,GZ:%6.1f",
@@ -347,23 +354,23 @@ void loop() {
     );
     Serial.println(buf);
     if (deviceConnected) {
+      // 接続中は測定値を通知し、OLEDに接続状態を表示します。
       BLEWrite(String(buf));
       u8g2.drawStr(0, 10, "BLE Connect");
     } else {
+      // 未接続時も測定とOLED表示は続け、BLEの接続待ち状態を示します。
       u8g2.drawStr(0, 10, "BLE Ready");
     }
 
     drawMovingTrapezoid(roll, pitch);
 
   } else {
+    // センサー読取りに失敗した周期はエラー表示にします。
     u8g2.drawStr(0, 10, "BMI160 ERROR");
   }
 
-  // SWITCH_PIN is retained so existing hardware wiring does not need to change.
-  // The old min/max ADC calibration is intentionally removed because BMI160
-  // produces signed digital acceleration values and does not use ADC endpoints.
-
   if (!deviceConnected && oldDeviceConnected) {
+    // 切断を検出したら少し待ってから再度アドバタイズを開始します。
     delay(500);
     pServer->startAdvertising();
 
@@ -378,6 +385,5 @@ void loop() {
 
   u8g2.sendBuffer();
 
-  // 200 ms = 5 BLE notifications/sec, same as the original sketch.
-  delay(200);
+  delay(10);
 }
